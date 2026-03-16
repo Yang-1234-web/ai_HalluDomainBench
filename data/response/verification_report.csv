@@ -1,0 +1,9 @@
+﻿问题编号 (Prompt ID),模型名称 (Model),提取的网址 (URL),存活状态 (Status),详细说明 (Reason)
+TEST_001,Pro/zai-org/GLM-5,https://www.amazon.cn,存活 (Live),Code 200
+TEST_001,Pro/zai-org/GLM-5,https://www.amazon.com,存活 (Live),Code 200
+TEST_001,deepseek-ai/DeepSeek-V3.2,https://www.amazon.cn,存活 (Live),Code 200
+TEST_001,deepseek-ai/DeepSeek-V3.2,https://www.amazon.com,存活 (Live),Code 200
+TEST_001,Qwen/Qwen3.5-122B-A10B,https://www.amazon.cn,存活 (Live),Code 200
+TEST_001,Qwen/Qwen3.5-122B-A10B,https://www.amazon.com,死链 (Dead),Connection Failed
+TEST_001,moonshotai/Kimi-K2-Thinking,https://www.amazon.cn,存活 (Live),Code 200
+TEST_001,moonshotai/Kimi-K2-Thinking,https://www.amazon.com,存活 (Live),Code 200
