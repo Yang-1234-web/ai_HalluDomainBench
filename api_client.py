@@ -1,9 +1,8 @@
-# api_clients.py
+# api_client.py
 from __future__ import annotations
 
 import json
-import urllib.error
-import urllib.request
+import requests
 from abc import ABC, abstractmethod
 
 
@@ -14,6 +13,13 @@ class BaseLLMClient(ABC):
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        # 引入 requests.Session() 建立连接池。
+        # 好处：不用每次请求都重新 TCP 握手，极大降低网络开销和被网关拦截的概率。
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        })
 
     @abstractmethod
     def chat_completion(
@@ -31,10 +37,9 @@ class BaseLLMClient(ABC):
 class SiliconFlowClient(BaseLLMClient):
     """
     针对 SiliconFlow (硅基流动) 平台的标准客户端。
-    严格遵守官方白名单开启 enable_thinking。
+    支持流式输出 (Stream) 解析，专治超大模型的假死超时。
     """
 
-    # 完全以官方文档为准的白名单
     THINKING_SUPPORTED_MODELS = {
         "Pro/zai-org/GLM-5",
         "Pro/zai-org/GLM-4.7",
@@ -78,56 +83,87 @@ class SiliconFlowClient(BaseLLMClient):
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "stream": True,  # <--- 核心修改：强制开启流式输出
         }
 
-        # 【修正点】：只认白名单，绝不盲目猜测
-        is_thinking_model = model in self.THINKING_SUPPORTED_MODELS
-
-        if is_thinking_model:
+        if model in self.THINKING_SUPPORTED_MODELS:
             payload["enable_thinking"] = True
 
-        req = urllib.request.Request(
-            url=self.base_url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        content_chunks = []
+        reasoning_chunks = []
+        finish_reason = ""
+        usage = {}
 
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        try:
+            # timeout=(连接超时, 读取超时)。只要服务器不断吐出哪怕一个字符，连接就不会断。
+            with self.session.post(
+                    url=self.base_url,
+                    json=payload,
+                    stream=True,
+                    timeout=(10.0, timeout_sec)
+            ) as resp:
 
-        message_data = body.get("choices", [])[0].get("message", {})
+                resp.raise_for_status()  # 遇到 4xx/5xx 错误直接抛出异常，交给 collect.py 捕获重试
 
-        # 无论 API 有没有明确要求开启思考参数，只要响应体里有 reasoning_content 就提取
-        reasoning_content = message_data.get("reasoning_content", "").strip()
+                # 解析 SSE (Server-Sent Events) 数据流
+                for line in resp.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith("data: "):
+                            data_str = decoded_line[6:]
+
+                            # 结束标志
+                            if data_str.strip() == "[DONE]":
+                                break
+
+                            try:
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+
+                                    # 累加普通回复
+                                    if "content" in delta and delta["content"]:
+                                        content_chunks.append(delta["content"])
+
+                                    # 累加思维链回复
+                                    if "reasoning_content" in delta and delta["reasoning_content"]:
+                                        reasoning_chunks.append(delta["reasoning_content"])
+
+                                    # 捕获结束原因
+                                    if choices[0].get("finish_reason"):
+                                        finish_reason = choices[0]["finish_reason"]
+
+                                # 捕获 Token 使用量 (通常在最后几个 chunk 中出现)
+                                if "usage" in chunk and chunk["usage"]:
+                                    usage = chunk["usage"]
+
+                            except json.JSONDecodeError:
+                                continue
+
+        except requests.exceptions.RequestException as e:
+            # 将 requests 的异常转译，兼容你 collect.py 中的捕获逻辑
+            raise RuntimeError(f"请求异常: {str(e)}")
 
         return {
-            "content": message_data.get("content", "").strip(),
-            "reasoning_content": reasoning_content,
-            "finish_reason": body.get("choices", [])[0].get("finish_reason", ""),
-            "usage": body.get("usage", {}),
-            "raw_response": body
+            "content": "".join(content_chunks).strip(),
+            "reasoning_content": "".join(reasoning_chunks).strip(),
+            "finish_reason": finish_reason,
+            "usage": usage,
+            "raw_response": "streamed"  # 流式输出不再保留单次完整的原始 body
         }
 
 
 class LLMFactory:
-    """
-    调用入口：根据模型名称自动分发到对应的客户端
-    """
-
     @staticmethod
     def get_client(model_name: str, api_keys: dict[str, str]) -> BaseLLMClient:
-        # 保留 "moonshotai/" 前缀，让系统能正常调用 Kimi，但不会向它发送 enable_thinking 参数
-        valid_prefixes = ("Qwen/", "Pro/", "deepseek-ai/", "zai-org/", "tencent/", "moonshotai/")
+        valid_prefixes = (
+            "Qwen/", "Pro/", "deepseek-ai/", "zai-org/", "tencent/", "moonshotai/",
+            "PaddlePaddle/", "baidu/", "internlm/", "inclusionAI/", "stepfun-ai/"
+        )
         if model_name.startswith(valid_prefixes):
-            return SiliconFlowClient(
-                api_key=api_keys.get("SILICONFLOW_API_KEY", "")
-            )
+            return SiliconFlowClient(api_key=api_keys.get("SILICONFLOW_API_KEY", ""))
         else:
             raise ValueError(f"暂未支持或无法识别的模型: {model_name}")
